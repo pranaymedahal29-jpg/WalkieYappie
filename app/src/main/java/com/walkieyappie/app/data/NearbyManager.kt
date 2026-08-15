@@ -43,6 +43,11 @@ data class PeerDevice(
     val name: String
 )
 
+data class ConnectionRequest(
+    val endpointId: String,
+    val requesterName: String
+)
+
 /**
  * Encapsulates mesh voice packet header for multi-hop deduplication, timestamp filtering, & forwarding.
  */
@@ -117,7 +122,7 @@ class NearbyManager(private val context: Context) {
         private val STRATEGY = Strategy.P2P_CLUSTER
         private const val UDP_PORT = 8888
         private const val MAX_HOPS = 10
-        private const val MAX_PACKET_AGE_MS = 800L // Drop stale packets delayed >800ms to eliminate 5s queueing lag
+        private const val MAX_PACKET_AGE_MS = 800L
     }
 
     private val connectionsClient: ConnectionsClient by lazy {
@@ -136,9 +141,13 @@ class NearbyManager(private val context: Context) {
     // Deduplication cache to prevent multi-hop echo loops
     private val seenPacketKeys = Collections.synchronizedSet(LinkedHashSet<String>())
 
-    // Discovered available peers waiting for connection
+    // Discovered available peers waiting for manual connection request
     private val _discoveredPeers = MutableStateFlow<List<PeerDevice>>(emptyList())
     val discoveredPeers: StateFlow<List<PeerDevice>> = _discoveredPeers.asStateFlow()
+
+    // Incoming connection requests waiting for recipient approval
+    private val _incomingRequests = MutableStateFlow<List<ConnectionRequest>>(emptyList())
+    val incomingRequests: StateFlow<List<ConnectionRequest>> = _incomingRequests.asStateFlow()
 
     // Connected active peers in N-device mesh
     private val _connectedPeers = MutableStateFlow<List<PeerDevice>>(emptyList())
@@ -169,34 +178,31 @@ class NearbyManager(private val context: Context) {
     private var udpSocket: DatagramSocket? = null
     private var udpJob: Job? = null
 
-    // 1. Connection Lifecycle Callback (Nearby Connections P2P)
+    // 1. Connection Lifecycle Callback (Explicit Request & Accept Model)
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            Log.d(TAG, "Connection initiated with callsign '${info.endpointName}' ($endpointId). Auto-accepting...")
+            Log.d(TAG, "Connection initiated by callsign '${info.endpointName}' ($endpointId). Waiting for manual approval...")
             pendingEndpointNames[endpointId] = info.endpointName
 
-            connectionsClient.acceptConnection(endpointId, payloadCallback)
-                .addOnSuccessListener {
-                    Log.d(TAG, "Accepted connection from ${info.endpointName} ($endpointId)")
-                }
-                .addOnFailureListener { e ->
-                    Log.e(TAG, "Failed to accept connection from $endpointId", e)
-                }
+            // Add to incoming requests state flow for explicit recipient approval (NO AUTO-ACCEPT)
+            val request = ConnectionRequest(endpointId = endpointId, requesterName = info.endpointName)
+            addIncomingRequest(request)
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
+            removeIncomingRequest(endpointId)
             when (result.status.statusCode) {
                 ConnectionsStatusCodes.STATUS_OK -> {
                     val peerName = pendingEndpointNames[endpointId]
                         ?: _discoveredPeers.value.find { it.endpointId == endpointId }?.name
                         ?: "Peer ${endpointId.take(4)}"
 
-                    Log.i(TAG, "Connected successfully to peer '$peerName' ($endpointId)")
+                    Log.i(TAG, "Connection APPROVED & Established with peer '$peerName' ($endpointId)")
                     addConnectedPeer(PeerDevice(endpointId = endpointId, name = peerName))
                     removeDiscoveredPeer(endpointId)
                 }
                 ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED -> {
-                    Log.w(TAG, "Connection rejected by $endpointId")
+                    Log.w(TAG, "Connection rejected for $endpointId")
                     pendingEndpointNames.remove(endpointId)
                 }
                 ConnectionsStatusCodes.STATUS_ERROR -> {
@@ -212,12 +218,13 @@ class NearbyManager(private val context: Context) {
         override fun onDisconnected(endpointId: String) {
             Log.i(TAG, "Peer disconnected: $endpointId")
             pendingEndpointNames.remove(endpointId)
+            removeIncomingRequest(endpointId)
             _connectedPeers.value = _connectedPeers.value.filter { it.endpointId != endpointId }
             updateStatusMessage()
         }
     }
 
-    // 2. Endpoint Discovery Callback
+    // 2. Endpoint Discovery Callback (No Auto-Connecting)
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             val callsignName = info.endpointName
@@ -225,8 +232,7 @@ class NearbyManager(private val context: Context) {
             val newDiscoveredPeer = PeerDevice(endpointId = endpointId, name = callsignName)
             addDiscoveredPeer(newDiscoveredPeer)
 
-            // Auto-connect to form seamless multi-device cluster
-            connectToPeer(endpointId)
+            // NO AUTO-CONNECT: User must explicitly tap "CONNECT" to send request
         }
 
         override fun onEndpointLost(endpointId: String) {
@@ -263,7 +269,7 @@ class NearbyManager(private val context: Context) {
     }
 
     /**
-     * Connects to a specific discovered endpoint ID.
+     * User A sends an explicit connection request to discovered endpoint ID.
      */
     fun connectToPeer(endpointId: String) {
         connectionsClient.requestConnection(
@@ -271,14 +277,44 @@ class NearbyManager(private val context: Context) {
             endpointId,
             connectionLifecycleCallback
         ).addOnSuccessListener {
-            Log.d(TAG, "Connection requested to $endpointId under username '$localUsername'")
+            Log.d(TAG, "Connection request sent to $endpointId under username '$localUsername'")
         }.addOnFailureListener { e ->
-            Log.e(TAG, "Failed to request connection to $endpointId", e)
+            Log.e(TAG, "Failed to send connection request to $endpointId", e)
         }
     }
 
     /**
-     * Connects to all N available discovered devices simultaneously.
+     * User B explicitly APPROVES an incoming connection request.
+     */
+    fun acceptConnectionRequest(endpointId: String) {
+        connectionsClient.acceptConnection(endpointId, payloadCallback)
+            .addOnSuccessListener {
+                Log.d(TAG, "Explicitly accepted connection request from $endpointId")
+                removeIncomingRequest(endpointId)
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to accept connection request from $endpointId", e)
+                removeIncomingRequest(endpointId)
+            }
+    }
+
+    /**
+     * User B explicitly REJECTS an incoming connection request.
+     */
+    fun rejectConnectionRequest(endpointId: String) {
+        connectionsClient.rejectConnection(endpointId)
+            .addOnSuccessListener {
+                Log.d(TAG, "Explicitly rejected connection request from $endpointId")
+                removeIncomingRequest(endpointId)
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Failed to reject connection request from $endpointId", e)
+                removeIncomingRequest(endpointId)
+            }
+    }
+
+    /**
+     * Sends connection requests to all available discovered devices.
      */
     fun connectToAllDiscoveredPeers() {
         _discoveredPeers.value.forEach { peer ->
@@ -410,7 +446,7 @@ class NearbyManager(private val context: Context) {
             return
         }
 
-        // 1. Stale Packet Drop Filter: Drop packets delayed >800ms in network/OS buffers
+        // Stale Packet Drop Filter: Drop packets delayed >800ms in network/OS buffers
         val packetAge = System.currentTimeMillis() - meshPacket.timestamp
         if (packetAge > MAX_PACKET_AGE_MS) {
             Log.d(TAG, "Dropped stale buffered packet (age=${packetAge}ms)")
@@ -454,10 +490,10 @@ class NearbyManager(private val context: Context) {
             }
         }
 
-        // 2. Play audio locally on current device
+        // 1. Play audio locally on current device
         onAudioPayloadReceived?.invoke(meshPacket.audioData)
 
-        // 3. Multi-Hop Relay Forwarding: Increment hop count and forward to neighboring nodes
+        // 2. Multi-Hop Relay Forwarding: Increment hop count and forward to neighboring nodes
         if (meshPacket.hopCount < MAX_HOPS) {
             val relayedPacket = meshPacket.copy(hopCount = meshPacket.hopCount + 1)
             val relayedBytes = relayedPacket.serialize()
@@ -527,6 +563,18 @@ class NearbyManager(private val context: Context) {
         _discoveredPeers.value = _discoveredPeers.value.filter { it.endpointId != endpointId }
     }
 
+    private fun addIncomingRequest(request: ConnectionRequest) {
+        val current = _incomingRequests.value.toMutableList()
+        if (current.none { it.endpointId == request.endpointId }) {
+            current.add(request)
+            _incomingRequests.value = current
+        }
+    }
+
+    private fun removeIncomingRequest(endpointId: String) {
+        _incomingRequests.value = _incomingRequests.value.filter { it.endpointId != endpointId }
+    }
+
     private fun addConnectedPeer(peer: PeerDevice) {
         val currentList = _connectedPeers.value.toMutableList()
         val existingIndex = currentList.indexOfFirst { it.endpointId == peer.endpointId }
@@ -564,6 +612,7 @@ class NearbyManager(private val context: Context) {
             _isAdvertising.value = false
             _isScanning.value = false
             _discoveredPeers.value = emptyList()
+            _incomingRequests.value = emptyList()
             _connectedPeers.value = emptyList()
             _connectionStatus.value = "Disconnected"
             Log.i(TAG, "Mesh network stopped completely")

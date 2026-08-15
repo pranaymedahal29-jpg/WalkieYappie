@@ -62,10 +62,13 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextAlign.Companion.Center
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.walkieyappie.app.audio.AudioOutputMode
+import com.walkieyappie.app.data.ConnectionRequest
 import com.walkieyappie.app.data.PeerDevice
 import com.walkieyappie.app.ui.theme.LedUnlitDot
 import com.walkieyappie.app.ui.theme.MatrixGreenButtonFill
@@ -224,6 +227,7 @@ fun WalkieTalkieScreen(viewModel: WalkieTalkieViewModel) {
     val username by viewModel.username.collectAsState()
     val showUsernameDialog by viewModel.showUsernameDialog.collectAsState()
     val discoveredPeers by viewModel.discoveredPeers.collectAsState()
+    val incomingRequests by viewModel.incomingRequests.collectAsState()
     val connectedPeers by viewModel.connectedPeers.collectAsState()
     val isScanning by viewModel.isScanning.collectAsState()
     val isTransmitting by viewModel.isTransmitting.collectAsState()
@@ -287,6 +291,7 @@ fun WalkieTalkieScreen(viewModel: WalkieTalkieViewModel) {
                     isTransmitting = isTransmitting,
                     isReceiving = isReceiving,
                     activeSpeakerName = activeSpeakerName,
+                    incomingRequests = incomingRequests,
                     discoveredPeers = discoveredPeers,
                     connectedPeers = connectedPeers,
                     isScanning = isScanning,
@@ -298,9 +303,11 @@ fun WalkieTalkieScreen(viewModel: WalkieTalkieViewModel) {
                 // 3. Interactive Connection Requests & Active Connections Panel (#002F00 block background)
                 ConnectionRequestsAndPeersPanel(
                     discoveredPeers = discoveredPeers,
+                    incomingRequests = incomingRequests,
                     connectedPeers = connectedPeers,
-                    onAcceptPeer = { id -> viewModel.connectToPeer(id) },
-                    onConnectAll = { viewModel.connectToAllDiscoveredPeers() }
+                    onRequestConnect = { id -> viewModel.connectToPeer(id) },
+                    onAcceptRequest = { id -> viewModel.acceptConnectionRequest(id) },
+                    onRejectRequest = { id -> viewModel.rejectConnectionRequest(id) }
                 )
 
                 Spacer(modifier = Modifier.height(16.dp))
@@ -349,6 +356,7 @@ fun LedMessageScreenBox(
     isTransmitting: Boolean,
     isReceiving: Boolean,
     activeSpeakerName: String?,
+    incomingRequests: List<ConnectionRequest>,
     discoveredPeers: List<PeerDevice>,
     connectedPeers: List<PeerDevice>,
     isScanning: Boolean,
@@ -373,8 +381,9 @@ fun LedMessageScreenBox(
                 isTransmitting -> "SPEAKING"
                 isReceiving && activeSpeakerName != null -> "RX: ${activeSpeakerName.take(6).uppercase()}"
                 isReceiving -> "RECEIVING"
+                incomingRequests.isNotEmpty() -> "REQ: ${incomingRequests.first().requesterName.take(6).uppercase()}"
                 connectedPeers.isNotEmpty() -> "CONN: ${connectedPeers.first().name.take(6).uppercase()}"
-                discoveredPeers.isNotEmpty() -> "REQ: ${discoveredPeers.first().name.take(6).uppercase()}"
+                discoveredPeers.isNotEmpty() -> "DISC: ${discoveredPeers.first().name.take(6).uppercase()}"
                 isScanning -> "SEARCHING"
                 else -> "STANDBY"
             }
@@ -382,14 +391,16 @@ fun LedMessageScreenBox(
             val line2 = when {
                 isTransmitting -> "TX ACTIVE"
                 isReceiving -> "VOICE STREAM"
+                incomingRequests.isNotEmpty() -> "INCOMING REQ"
                 connectedPeers.isNotEmpty() -> "${connectedPeers.size} PEER MESH"
-                discoveredPeers.isNotEmpty() -> "INCOMING REQ"
+                discoveredPeers.isNotEmpty() -> "SEND REQUEST"
                 else -> "CALL: ${localUsername.take(6).uppercase()}"
             }
 
             val line3 = when {
+                incomingRequests.isNotEmpty() -> "ACCEPT / REJECT"
                 connectedPeers.isNotEmpty() -> "CH 01 ACTIVE"
-                discoveredPeers.isNotEmpty() -> "TAP TO ACCEPT"
+                discoveredPeers.isNotEmpty() -> "TAP TO PAIR"
                 isScanning -> "BLE DISCOVERY"
                 else -> "IDLE MESH"
             }
@@ -426,60 +437,122 @@ fun LedMessageScreenBox(
 
 /**
  * Interactive connection requests list and active connected devices list panel (#002F00 block background).
+ * Implements explicit Request and Accept model (NO auto-connecting).
  */
 @Composable
 fun ConnectionRequestsAndPeersPanel(
     discoveredPeers: List<PeerDevice>,
+    incomingRequests: List<ConnectionRequest>,
     connectedPeers: List<PeerDevice>,
-    onAcceptPeer: (String) -> Unit,
-    onConnectAll: () -> Unit
+    onRequestConnect: (String) -> Unit,
+    onAcceptRequest: (String) -> Unit,
+    onRejectRequest: (String) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        // Discovered / Incoming Requests (#002F00 block background)
-        if (discoveredPeers.isNotEmpty()) {
+        // 1. INCOMING CONNECTION REQUESTS (Recipient Explicit Approval Block)
+        if (incomingRequests.isNotEmpty()) {
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 6.dp)
-                    .border(1.5.dp, MatrixGreenOutline, RoundedCornerShape(8.dp)),
+                    .padding(bottom = 8.dp)
+                    .border(2.dp, MatrixGreenOutline, RoundedCornerShape(8.dp)),
                 colors = CardDefaults.cardColors(containerColor = MatrixGreenIncomingBlock),
                 shape = RoundedCornerShape(8.dp)
             ) {
                 Column(modifier = Modifier.padding(10.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        DotMatrixText(
-                            text = "INCOMING REQ (${discoveredPeers.size})",
-                            litColor = MatrixGreenText,
-                            unlitColor = LedUnlitDot,
-                            dotSize = 1.5.dp,
-                            dotSpacing = 0.8.dp,
-                            charSpacing = 2.dp
-                        )
-
-                        Surface(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(4.dp))
-                                .clickable { onConnectAll() }
-                                .border(1.dp, MatrixGreenOutline, RoundedCornerShape(4.dp)),
-                            color = MatrixGreenButtonFill
-                        ) {
-                            DotMatrixText(
-                                text = "ACCEPT ALL",
-                                litColor = MatrixGreenText,
-                                unlitColor = LedUnlitDot,
-                                dotSize = 1.2.dp,
-                                dotSpacing = 0.6.dp,
-                                charSpacing = 1.5.dp,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                            )
-                        }
-                    }
+                    DotMatrixText(
+                        text = "INCOMING REQ (${incomingRequests.size})",
+                        litColor = MatrixGreenText,
+                        unlitColor = LedUnlitDot,
+                        dotSize = 1.5.dp,
+                        dotSpacing = 0.8.dp,
+                        charSpacing = 2.dp
+                    )
 
                     Spacer(modifier = Modifier.height(8.dp))
+
+                    incomingRequests.forEach { req ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp)
+                                .background(PitchBlack, RoundedCornerShape(6.dp))
+                                .border(1.dp, MatrixGreenOutline.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                        ) {
+                            DotMatrixText(
+                                text = req.requesterName.take(8).uppercase(),
+                                litColor = MatrixGreenText,
+                                unlitColor = LedUnlitDot,
+                                dotSize = 1.6.dp,
+                                dotSpacing = 0.8.dp,
+                                charSpacing = 2.dp
+                            )
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Button(
+                                    onClick = { onAcceptRequest(req.endpointId) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MatrixGreenButtonFill),
+                                    border = BorderStroke(1.dp, MatrixGreenOutline),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.height(30.dp)
+                                ) {
+                                    DotMatrixText(
+                                        text = "ACCEPT",
+                                        litColor = MatrixGreenText,
+                                        unlitColor = LedUnlitDot,
+                                        dotSize = 1.2.dp,
+                                        dotSpacing = 0.6.dp,
+                                        charSpacing = 1.5.dp
+                                    )
+                                }
+
+                                Button(
+                                    onClick = { onRejectRequest(req.endpointId) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0x66FF3D00)),
+                                    border = BorderStroke(1.dp, StatusRed),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.height(30.dp)
+                                ) {
+                                    DotMatrixText(
+                                        text = "REJECT",
+                                        litColor = StatusRed,
+                                        unlitColor = LedUnlitDot,
+                                        dotSize = 1.2.dp,
+                                        dotSpacing = 0.6.dp,
+                                        charSpacing = 1.5.dp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. DISCOVERED NEARBY PEERS (Send Request List)
+        if (discoveredPeers.isNotEmpty()) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp)
+                    .border(1.5.dp, MatrixGreenOutline.copy(alpha = 0.8f), RoundedCornerShape(8.dp)),
+                colors = CardDefaults.cardColors(containerColor = MatrixGreenIncomingBlock),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Column(modifier = Modifier.padding(10.dp)) {
+                    DotMatrixText(
+                        text = "DISCOVERED NEARBY (${discoveredPeers.size})",
+                        litColor = MatrixGreenText,
+                        unlitColor = LedUnlitDot,
+                        dotSize = 1.4.dp,
+                        dotSpacing = 0.7.dp,
+                        charSpacing = 1.8.dp
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     discoveredPeers.forEach { peer ->
                         Row(
@@ -496,20 +569,20 @@ fun ConnectionRequestsAndPeersPanel(
                                 text = peer.name.take(8).uppercase(),
                                 litColor = MatrixGreenText,
                                 unlitColor = LedUnlitDot,
-                                dotSize = 1.6.dp,
-                                dotSpacing = 0.8.dp,
-                                charSpacing = 2.dp
+                                dotSize = 1.5.dp,
+                                dotSpacing = 0.7.dp,
+                                charSpacing = 1.8.dp
                             )
 
                             Button(
-                                onClick = { onAcceptPeer(peer.endpointId) },
+                                onClick = { onRequestConnect(peer.endpointId) },
                                 colors = ButtonDefaults.buttonColors(containerColor = MatrixGreenButtonFill),
                                 border = BorderStroke(1.dp, MatrixGreenOutline),
                                 shape = RoundedCornerShape(6.dp),
                                 modifier = Modifier.height(30.dp)
                             ) {
                                 DotMatrixText(
-                                    text = "ACCEPT",
+                                    text = "CONNECT",
                                     litColor = MatrixGreenText,
                                     unlitColor = LedUnlitDot,
                                     dotSize = 1.2.dp,
@@ -523,7 +596,7 @@ fun ConnectionRequestsAndPeersPanel(
             }
         }
 
-        // Active Connections Banner (#002F00 block background)
+        // 3. ACTIVE CONNECTED MESH NODES
         if (connectedPeers.isNotEmpty()) {
             Card(
                 modifier = Modifier
@@ -613,7 +686,7 @@ fun StatusIndicatorRow(
 
         // Blue - FINDING NEARBY DEVICES (BLINKING)
         StatusCircleItem(
-            label = "FINDING\nNEARBY\nDEVICES",
+            label = "FINDING\nNEARBY\nDEVICES\n(BLINKING)",
             color = StatusBlue,
             isActive = isScanning,
             alphaModifier = if (isScanning) blinkAlpha else 1.0f
@@ -947,12 +1020,12 @@ fun PermissionGuardView(onRequestPermissions: () -> Unit) {
 
         Spacer(modifier = Modifier.height(14.dp))
 
-//        Text(
-//            text = "WalkieYappie requires Microphone, Bluetooth, and Nearby Wi-Fi permissions to establish CB radio mesh connections.",
-//            fontSize = 13.sp,
-//            color = MatrixGreenText,
-//            textAlign = TextAlign.Center
-//        )
+        Text(
+            text = "WalkieYappie requires Microphone, Bluetooth, and Nearby Wi-Fi permissions to establish CB radio mesh connections.",
+            fontSize = 13.sp,
+            color = MatrixGreenText,
+            textAlign = Center
+        )
 
         Spacer(modifier = Modifier.height(28.dp))
 

@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.walkieyappie.app.audio.AudioEngine
 import com.walkieyappie.app.audio.AudioOutputMode
+import com.walkieyappie.app.data.ConnectionRequest
 import com.walkieyappie.app.data.NearbyManager
 import com.walkieyappie.app.data.PeerDevice
 import com.walkieyappie.app.util.PermissionsUtils
@@ -40,6 +41,7 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     val connectionStatus: StateFlow<String> = nearbyManager.connectionStatus
     val discoveredPeers: StateFlow<List<PeerDevice>> = nearbyManager.discoveredPeers
+    val incomingRequests: StateFlow<List<ConnectionRequest>> = nearbyManager.incomingRequests
     val connectedPeers: StateFlow<List<PeerDevice>> = nearbyManager.connectedPeers
     val isScanning: StateFlow<Boolean> = nearbyManager.isScanning
     val isReceivingAudio: StateFlow<Boolean> = nearbyManager.isReceivingAudio
@@ -97,6 +99,14 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
 
     fun connectToPeer(endpointId: String) {
         nearbyManager.connectToPeer(endpointId)
+    }
+
+    fun acceptConnectionRequest(endpointId: String) {
+        nearbyManager.acceptConnectionRequest(endpointId)
+    }
+
+    fun rejectConnectionRequest(endpointId: String) {
+        nearbyManager.rejectConnectionRequest(endpointId)
     }
 
     fun connectToAllDiscoveredPeers() {
