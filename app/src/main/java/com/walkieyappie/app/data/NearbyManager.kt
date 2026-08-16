@@ -123,6 +123,52 @@ class NearbyManager(private val context: Context) {
         private const val UDP_PORT = 8888
         private const val MAX_HOPS = 10
         private const val MAX_PACKET_AGE_MS = 800L
+
+        private fun serializePeerAnnouncement(peers: List<PeerDevice>): ByteArray {
+            val baos = ByteArrayOutputStream()
+            val dos = DataOutputStream(baos)
+            dos.writeByte(0x50) // Magic byte 'P' for Peer Announcement
+            dos.writeShort(peers.size)
+            for (peer in peers) {
+                val idBytes = peer.endpointId.toByteArray(Charsets.UTF_8)
+                dos.writeShort(idBytes.size)
+                dos.write(idBytes)
+
+                val nameBytes = peer.name.toByteArray(Charsets.UTF_8)
+                dos.writeShort(nameBytes.size)
+                dos.write(nameBytes)
+            }
+            dos.flush()
+            return baos.toByteArray()
+        }
+
+        private fun deserializePeerAnnouncement(bytes: ByteArray): List<PeerDevice>? {
+            return try {
+                if (bytes.isEmpty() || bytes[0] != 0x50.toByte()) return null
+                val bais = ByteArrayInputStream(bytes)
+                val dis = DataInputStream(bais)
+                dis.readByte() // Skip 'P'
+
+                val size = dis.readShort().toInt()
+                val list = mutableListOf<PeerDevice>()
+                for (i in 0 until size) {
+                    val idLen = dis.readShort().toInt()
+                    val idBytes = ByteArray(idLen)
+                    dis.readFully(idBytes)
+                    val endpointId = String(idBytes, Charsets.UTF_8)
+
+                    val nameLen = dis.readShort().toInt()
+                    val nameBytes = ByteArray(nameLen)
+                    dis.readFully(nameBytes)
+                    val name = String(nameBytes, Charsets.UTF_8)
+
+                    list.add(PeerDevice(endpointId, name))
+                }
+                list
+            } catch (e: Exception) {
+                null
+            }
+        }
     }
 
     private val connectionsClient: ConnectionsClient by lazy {
@@ -137,6 +183,9 @@ class NearbyManager(private val context: Context) {
 
     // Pending peer names map (endpointId -> remote callsign name)
     private val pendingEndpointNames = ConcurrentHashMap<String, String>()
+
+    // Set of pre-announced mesh endpoints for full-mesh direct auto-interconnection
+    private val knownMeshEndpoints = Collections.synchronizedSet(HashSet<String>())
 
     // Deduplication cache to prevent multi-hop echo loops
     private val seenPacketKeys = Collections.synchronizedSet(LinkedHashSet<String>())
@@ -178,15 +227,21 @@ class NearbyManager(private val context: Context) {
     private var udpSocket: DatagramSocket? = null
     private var udpJob: Job? = null
 
-    // 1. Connection Lifecycle Callback (Explicit Request & Accept Model)
+    // 1. Connection Lifecycle Callback (Request-Accept + Full Mesh Direct Auto-Interconnection)
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            Log.d(TAG, "Connection initiated by callsign '${info.endpointName}' ($endpointId). Waiting for manual approval...")
+            Log.d(TAG, "Connection initiated by callsign '${info.endpointName}' ($endpointId)")
             pendingEndpointNames[endpointId] = info.endpointName
 
-            // Add to incoming requests state flow for explicit recipient approval (NO AUTO-ACCEPT)
-            val request = ConnectionRequest(endpointId = endpointId, requesterName = info.endpointName)
-            addIncomingRequest(request)
+            if (knownMeshEndpoints.contains(endpointId)) {
+                // Pre-announced mesh peer attempting direct 1-hop interconnection: Auto-accept direct link
+                Log.i(TAG, "Peer '$endpointId' is pre-announced in mesh cluster. Auto-accepting direct link...")
+                connectionsClient.acceptConnection(endpointId, payloadCallback)
+            } else {
+                // New initial device request: Requires explicit recipient user approval
+                val request = ConnectionRequest(endpointId = endpointId, requesterName = info.endpointName)
+                addIncomingRequest(request)
+            }
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
@@ -200,6 +255,10 @@ class NearbyManager(private val context: Context) {
                     Log.i(TAG, "Connection APPROVED & Established with peer '$peerName' ($endpointId)")
                     addConnectedPeer(PeerDevice(endpointId = endpointId, name = peerName))
                     removeDiscoveredPeer(endpointId)
+                    knownMeshEndpoints.add(endpointId)
+
+                    // Announce existing mesh peers to new endpoint, and announce new endpoint to existing mesh peers for full-mesh direct links
+                    syncMeshPeerAnnouncements(newEndpointId = endpointId, newPeerName = peerName)
                 }
                 ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED -> {
                     Log.w(TAG, "Connection rejected for $endpointId")
@@ -224,15 +283,13 @@ class NearbyManager(private val context: Context) {
         }
     }
 
-    // 2. Endpoint Discovery Callback (No Auto-Connecting)
+    // 2. Endpoint Discovery Callback (No Auto-Connecting for unknown peers)
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             val callsignName = info.endpointName
             Log.d(TAG, "Discovered nearby endpoint: '$callsignName' ($endpointId)")
             val newDiscoveredPeer = PeerDevice(endpointId = endpointId, name = callsignName)
             addDiscoveredPeer(newDiscoveredPeer)
-
-            // NO AUTO-CONNECT: User must explicitly tap "CONNECT" to send request
         }
 
         override fun onEndpointLost(endpointId: String) {
@@ -241,7 +298,7 @@ class NearbyManager(private val context: Context) {
         }
     }
 
-    // 3. Payload Callback for processing incoming voice data
+    // 3. Payload Callback for processing incoming voice data & mesh control announcements
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             when (payload.type) {
@@ -265,6 +322,25 @@ class NearbyManager(private val context: Context) {
                 update.status == PayloadTransferUpdate.Status.CANCELED) {
                 _isReceivingAudio.value = false
             }
+        }
+    }
+
+    /**
+     * Announces existing mesh nodes to a newly joined endpoint, and announces the new endpoint
+     * to all existing mesh nodes to trigger direct 1-hop interconnections if in radio range.
+     */
+    private fun syncMeshPeerAnnouncements(newEndpointId: String, newPeerName: String) {
+        val existingPeers = _connectedPeers.value.filter { it.endpointId != newEndpointId && !it.endpointId.startsWith("lan_") }
+
+        if (existingPeers.isNotEmpty()) {
+            // 1. Send existing peer list to new endpoint
+            val announceToNewBytes = serializePeerAnnouncement(existingPeers)
+            connectionsClient.sendPayload(newEndpointId, Payload.fromBytes(announceToNewBytes))
+
+            // 2. Send new peer info to existing endpoints
+            val announceNewBytes = serializePeerAnnouncement(listOf(PeerDevice(newEndpointId, newPeerName)))
+            val targetEndpoints = existingPeers.map { it.endpointId }
+            connectionsClient.sendPayload(targetEndpoints, Payload.fromBytes(announceNewBytes))
         }
     }
 
@@ -434,10 +510,26 @@ class NearbyManager(private val context: Context) {
     }
 
     /**
-     * Processes incoming mesh audio bytes, drops stale buffered packets, checks deduplication cache,
-     * plays audio locally, and performs Multi-Hop Relay forwarding.
+     * Processes incoming mesh voice bytes or peer announcement control packets, drops stale buffered packets,
+     * checks deduplication cache, plays audio locally, and performs Multi-Hop Relay forwarding.
      */
     private fun handleIncomingMeshBytes(rawBytes: ByteArray, sourceEndpointId: String) {
+        // Check for Peer Announcement Control Packet (Magic byte 0x50 'P')
+        if (rawBytes.isNotEmpty() && rawBytes[0] == 0x50.toByte()) {
+            val announcedPeers = deserializePeerAnnouncement(rawBytes)
+            if (announcedPeers != null) {
+                announcedPeers.forEach { peer ->
+                    knownMeshEndpoints.add(peer.endpointId)
+                    if (peer.endpointId != localDeviceUuid &&
+                        !_connectedPeers.value.any { it.endpointId == peer.endpointId }) {
+                        Log.i(TAG, "Received Mesh Peer Announcement for '${peer.name}' (${peer.endpointId}). Attempting direct 1-hop connection...")
+                        connectToPeer(peer.endpointId)
+                    }
+                }
+            }
+            return
+        }
+
         val meshPacket = MeshPacket.deserialize(rawBytes)
         if (meshPacket == null) {
             _isReceivingAudio.value = true
@@ -493,7 +585,7 @@ class NearbyManager(private val context: Context) {
         // 1. Play audio locally on current device
         onAudioPayloadReceived?.invoke(meshPacket.audioData)
 
-        // 2. Multi-Hop Relay Forwarding: Increment hop count and forward to neighboring nodes
+        // 2. Multi-Hop Relay Forwarding (for out-of-range nodes): Increment hop count and forward to neighboring nodes
         if (meshPacket.hopCount < MAX_HOPS) {
             val relayedPacket = meshPacket.copy(hopCount = meshPacket.hopCount + 1)
             val relayedBytes = relayedPacket.serialize()
@@ -614,6 +706,7 @@ class NearbyManager(private val context: Context) {
             _discoveredPeers.value = emptyList()
             _incomingRequests.value = emptyList()
             _connectedPeers.value = emptyList()
+            knownMeshEndpoints.clear()
             _connectionStatus.value = "Disconnected"
             Log.i(TAG, "Mesh network stopped completely")
         } catch (e: Exception) {
