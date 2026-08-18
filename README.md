@@ -25,7 +25,7 @@ It works on the principle of direct device-to-device connection and transmits au
 ---
 ### Architecture and Network topology
 
-![[Pasted image 20260819003342.png]]
+<img width="4944" height="927" alt="Untitled diagram-2026-08-18-183837" src="https://github.com/user-attachments/assets/95c431ea-5b68-4022-90fc-cfaf5bfe3739" />
 
 ### Installation
 1. Download `WalkieYappie-v1.0.0.apk` attached to this release.
