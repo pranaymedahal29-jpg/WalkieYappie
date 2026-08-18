@@ -10,10 +10,13 @@ import com.walkieyappie.app.audio.AudioOutputMode
 import com.walkieyappie.app.data.ConnectionRequest
 import com.walkieyappie.app.data.NearbyManager
 import com.walkieyappie.app.data.PeerDevice
+import com.walkieyappie.app.util.MeshNotificationManager
 import com.walkieyappie.app.util.PermissionsUtils
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
 
 class WalkieTalkieViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -63,6 +66,30 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         // Wire mic recorded audio bytes to Nearby Connections P2P and UDP LAN broadcast
         audioEngine.onAudioChunkCaptured = { chunk ->
             nearbyManager.sendAudioBytes(chunk, viewModelScope)
+        }
+
+        // Real-time system notification updates reflecting active speaker and mesh status
+        viewModelScope.launch {
+            combine(
+                activeSpeakerName,
+                isTransmitting,
+                connectedPeers,
+                isScanning
+            ) { speaker, transmitting, peers, scanning ->
+                when {
+                    transmitting -> "🔴 Transmitting Voice (You)"
+                    speaker != null -> "🔊 ${speaker.uppercase()} IS SPEAKING..."
+                    peers.isNotEmpty() -> "🟢 Connected to ${peers.size} node(s) - Listening"
+                    scanning -> "🔵 Scanning for nearby peers..."
+                    else -> "Standby - Tap SCAN to connect"
+                }
+            }.collect { statusText ->
+                MeshNotificationManager.updateNotification(
+                    application,
+                    title = "WalkieYappie Radio Mesh",
+                    contentText = statusText
+                )
+            }
         }
 
         if (_hasPermissions.value && _username.value.isNotEmpty()) {
@@ -157,5 +184,6 @@ class WalkieTalkieViewModel(application: Application) : AndroidViewModel(applica
         super.onCleared()
         audioEngine.release()
         nearbyManager.stopMeshNetwork()
+        MeshNotificationManager.cancelNotification(getApplication())
     }
 }

@@ -7,6 +7,7 @@ import androidx.activity.viewModels
 import com.walkieyappie.app.ui.WalkieTalkieScreen
 import com.walkieyappie.app.ui.WalkieTalkieViewModel
 import com.walkieyappie.app.ui.theme.WalkieYappieTheme
+import com.walkieyappie.app.util.MeshNotificationManager
 
 class MainActivity : ComponentActivity() {
 
@@ -24,5 +25,10 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         viewModel.startMeshNetwork()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        MeshNotificationManager.cancelNotification(applicationContext)
     }
 }

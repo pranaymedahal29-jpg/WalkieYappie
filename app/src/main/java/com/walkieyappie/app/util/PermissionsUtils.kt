@@ -28,9 +28,10 @@ object PermissionsUtils {
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
-        // Android 13 (API 33) introduced NEARBY_WIFI_DEVICES permission
+        // Android 13 (API 33) introduced NEARBY_WIFI_DEVICES and POST_NOTIFICATIONS permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
         return permissions.toTypedArray()
